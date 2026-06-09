@@ -12,7 +12,7 @@ APP_TOKEN = os.getenv("FENIX_TOKEN", "troque-este-token")
 FENIX_APP_URL = os.getenv("FENIX_APP_URL", "https://cs2item-calculator-by-fenixs.streamlit.app/")
 STEAMDT_BASE = "https://www.steamdt.com/en"
 
-app = FastAPI(title="Fenix Sheets API", version="1.5.0")
+app = FastAPI(title="Fenix Sheets API", version="1.6.0")
 
 
 def build_steamdt_search_url(item: str) -> str:
@@ -36,10 +36,12 @@ def money_to_float(text: str) -> Optional[float]:
     cleaned = re.sub(r"[^0-9.,]", "", text or "")
     if not cleaned:
         return None
+
     if "," in cleaned and "." in cleaned:
         cleaned = cleaned.replace(",", "")
     elif "," in cleaned and "." not in cleaned:
         cleaned = cleaned.replace(",", ".")
+
     try:
         return float(cleaned)
     except ValueError:
@@ -97,41 +99,43 @@ def load_fenix(page):
 
     response = page.goto(FENIX_APP_URL, wait_until="domcontentloaded", timeout=120000)
 
-    for _ in range(9):
+    for _ in range(12):
         page.wait_for_timeout(10000)
-
-        all_inputs = 0
-        all_textareas = 0
-        all_buttons = 0
-        all_text = ""
 
         for frame in page.frames:
             try:
-                all_inputs += frame.locator("input").count()
-                all_textareas += frame.locator("textarea").count()
-                all_buttons += frame.locator("button").count()
-                all_text += "\n" + frame.locator("body").inner_text(timeout=3000)
+                text = frame.locator("body").inner_text(timeout=3000)
+                inputs = frame.locator("input").count()
+                buttons = frame.locator("button").count()
+
+                if "FenixS" in text and inputs > 0 and buttons > 0:
+                    return response, console_logs, page_errors
             except Exception:
                 pass
-
-        if all_inputs > 0 or all_textareas > 0 or all_buttons > 0 or len(all_text.strip()) > 20:
-            break
 
     return response, console_logs, page_errors
 
 
 def find_working_frame(page):
+    # Prioriza o frame real do app FenixS
     for frame in page.frames:
         try:
-            inputs = frame.locator("input").count()
-            textareas = frame.locator("textarea").count()
-            buttons = frame.locator("button").count()
             text = frame.locator("body").inner_text(timeout=3000)
+            inputs = frame.locator("input").count()
+            buttons = frame.locator("button").count()
 
-            if inputs > 0 or textareas > 0 or buttons > 0 or len(text.strip()) > 20:
+            if "FenixS" in text and inputs > 0 and buttons > 0:
                 return frame
         except Exception:
-            continue
+            pass
+
+    # Segunda tentativa: qualquer frame com input
+    for frame in page.frames:
+        try:
+            if frame.locator("input").count() > 0:
+                return frame
+        except Exception:
+            pass
 
     return page.main_frame
 
@@ -184,6 +188,8 @@ def analyze_with_browser(item: str):
 
             inputs = frame.locator("input").count()
             textareas = frame.locator("textarea").count()
+            buttons = frame.locator("button").count()
+            frame_text = frame.locator("body").inner_text(timeout=5000)
 
             if inputs > 0:
                 field = frame.locator("input").first
@@ -193,9 +199,9 @@ def analyze_with_browser(item: str):
                 raise HTTPException(
                     status_code=502,
                     detail={
-                        "erro": "Nenhum campo encontrado nem dentro dos iframes.",
+                        "erro": "Nenhum campo encontrado no frame correto.",
                         "status": response.status if response else None,
-                        "title": page.title(),
+                        "frame_text": frame_text[:2000],
                         "frames": get_all_frame_debug(page),
                         "console_logs": console_logs[-30:],
                         "page_errors": page_errors[-20:],
@@ -205,13 +211,14 @@ def analyze_with_browser(item: str):
             field.fill(fenix_input_url)
             page.wait_for_timeout(1500)
 
+            # Clica no botão Analyze. Primeiro tenta por texto, depois pelo botão após o campo.
             try:
                 button = frame.get_by_role("button", name=re.compile("analyze|analisar", re.I)).first
                 button.click(timeout=60000)
             except Exception:
-                frame.locator("button").last.click(timeout=60000)
+                frame.locator("button").nth(1).click(timeout=60000)
 
-            page.wait_for_timeout(45000)
+            page.wait_for_timeout(50000)
 
             final_text = ""
             for fr in page.frames:
@@ -227,7 +234,7 @@ def analyze_with_browser(item: str):
                     status_code=502,
                     detail={
                         "erro": "Não consegui ler Est. Supply ou Market Valuation.",
-                        "preview_texto": final_text[:3000],
+                        "preview_texto": final_text[:3500],
                         "frames": get_all_frame_debug(page),
                     },
                 )
@@ -255,7 +262,7 @@ def analyze_with_browser(item: str):
 
 @app.get("/")
 def home():
-    return {"ok": True, "service": "Fenix Sheets API", "version": "1.5.0"}
+    return {"ok": True, "service": "Fenix Sheets API", "version": "1.6.0"}
 
 
 @app.get("/health")
