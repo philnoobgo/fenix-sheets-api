@@ -12,7 +12,7 @@ APP_TOKEN = os.getenv("FENIX_TOKEN", "troque-este-token")
 FENIX_APP_URL = os.getenv("FENIX_APP_URL", "https://cs2item-calculator-by-fenixs.streamlit.app/")
 STEAMDT_BASE = "https://www.steamdt.com/en"
 
-app = FastAPI(title="Fenix Sheets API", version="1.1.0")
+app = FastAPI(title="Fenix Sheets API", version="1.2.0")
 
 
 def build_steamdt_search_url(item: str) -> str:
@@ -34,11 +34,7 @@ def get_usd_brl() -> float:
 
 
 def money_to_float(text: str) -> Optional[float]:
-    if not text:
-        return None
-
-    cleaned = re.sub(r"[^0-9.,]", "", text)
-
+    cleaned = re.sub(r"[^0-9.,]", "", text or "")
     if not cleaned:
         return None
 
@@ -75,34 +71,45 @@ def analyze_with_browser(item: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
         )
 
         page = browser.new_page(viewport={"width": 1600, "height": 1000})
 
         try:
-            page.goto(
-                FENIX_APP_URL,
-                wait_until="domcontentloaded",
-                timeout=90000,
-            )
+            page.goto(FENIX_APP_URL, wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(15000)
 
-            page.wait_for_timeout(10000)
+            total_inputs = page.locator("input").count()
+            total_textareas = page.locator("textarea").count()
 
-            input_box = page.locator('input[type="text"]').first
-            input_box.wait_for(state="visible", timeout=90000)
-            input_box.fill(fenix_input_url)
+            if total_inputs > 0:
+                field = page.locator("input").first
+            elif total_textareas > 0:
+                field = page.locator("textarea").first
+            else:
+                body_preview = page.locator("body").inner_text(timeout=30000)
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "erro": "Nenhum input ou textarea encontrado no Fenix Engine.",
+                        "body_preview": body_preview[:2000],
+                    },
+                )
+
+            field.wait_for(state="visible", timeout=120000)
+            field.fill(fenix_input_url)
 
             page.wait_for_timeout(1000)
 
-            analyze_button = page.get_by_text("ANALYZE", exact=False).first
-            analyze_button.click(timeout=60000)
+            try:
+                button = page.get_by_role("button", name=re.compile("analyze|analisar", re.I)).first
+                button.click(timeout=60000)
+            except Exception:
+                button = page.locator("button").last
+                button.click(timeout=60000)
 
-            page.wait_for_timeout(30000)
+            page.wait_for_timeout(35000)
 
             body_text = page.locator("body").inner_text(timeout=60000)
 
@@ -113,7 +120,7 @@ def analyze_with_browser(item: str):
                     status_code=502,
                     detail={
                         "erro": "Não consegui ler Est. Supply ou Market Valuation.",
-                        "preview_texto": body_text[:2000],
+                        "preview_texto": body_text[:2500],
                     },
                 )
 
@@ -141,9 +148,46 @@ def analyze_with_browser(item: str):
             browser.close()
 
 
+@app.get("/")
+def home():
+    return {
+        "ok": True,
+        "service": "Fenix Sheets API",
+        "routes": ["/health", "/debug", "/analyze?item=Sticker%20%7C%20FalleN%20(Holo)%20%7C%20Cologne%202026"],
+    }
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/debug")
+def debug():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        )
+
+        page = browser.new_page(viewport={"width": 1600, "height": 1000})
+
+        try:
+            page.goto(FENIX_APP_URL, wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(30000)
+
+            body_text = page.locator("body").inner_text(timeout=30000)
+
+            return {
+                "fenix_url": FENIX_APP_URL,
+                "inputs": page.locator("input").count(),
+                "textareas": page.locator("textarea").count(),
+                "buttons": page.locator("button").count(),
+                "body_preview": body_text[:3000],
+            }
+
+        finally:
+            browser.close()
 
 
 @app.get("/analyze")
