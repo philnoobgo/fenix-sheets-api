@@ -12,7 +12,7 @@ APP_TOKEN = os.getenv("FENIX_TOKEN", "troque-este-token")
 FENIX_APP_URL = os.getenv("FENIX_APP_URL", "https://cs2item-calculator-by-fenixs.streamlit.app/")
 STEAMDT_BASE = "https://www.steamdt.com/en"
 
-app = FastAPI(title="Fenix Sheets API", version="1.2.0")
+app = FastAPI(title="Fenix Sheets API", version="1.3.0")
 
 
 def build_steamdt_search_url(item: str) -> str:
@@ -35,6 +35,7 @@ def get_usd_brl() -> float:
 
 def money_to_float(text: str) -> Optional[float]:
     cleaned = re.sub(r"[^0-9.,]", "", text or "")
+
     if not cleaned:
         return None
 
@@ -64,6 +65,21 @@ def extract_metrics_from_text(text: str):
     return supply, valuation_usd
 
 
+def open_fenix_page(page):
+    response = page.goto(
+        FENIX_APP_URL,
+        wait_until="load",
+        timeout=120000,
+    )
+
+    page.wait_for_timeout(45000)
+
+    html = page.content()
+    body_text = page.locator("body").inner_text(timeout=30000)
+
+    return response, html, body_text
+
+
 def analyze_with_browser(item: str):
     steamdt_search_url = build_steamdt_search_url(item)
     fenix_input_url = build_fenix_input_url(item)
@@ -71,29 +87,45 @@ def analyze_with_browser(item: str):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
 
-        page = browser.new_page(viewport={"width": 1600, "height": 1000})
+        page = browser.new_page(
+            viewport={"width": 1600, "height": 1000},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        )
 
         try:
-            page.goto(FENIX_APP_URL, wait_until="domcontentloaded", timeout=120000)
-            page.wait_for_timeout(15000)
+            response, html, body_text = open_fenix_page(page)
 
             total_inputs = page.locator("input").count()
             total_textareas = page.locator("textarea").count()
+            total_buttons = page.locator("button").count()
 
             if total_inputs > 0:
                 field = page.locator("input").first
             elif total_textareas > 0:
                 field = page.locator("textarea").first
             else:
-                body_preview = page.locator("body").inner_text(timeout=30000)
                 raise HTTPException(
                     status_code=502,
                     detail={
                         "erro": "Nenhum input ou textarea encontrado no Fenix Engine.",
-                        "body_preview": body_preview[:2000],
+                        "status": response.status if response else None,
+                        "final_url": page.url,
+                        "title": page.title(),
+                        "html_length": len(html),
+                        "body_length": len(body_text),
+                        "inputs": total_inputs,
+                        "textareas": total_textareas,
+                        "buttons": total_buttons,
+                        "html_preview": html[:2000],
+                        "body_preview": body_text[:2000],
                     },
                 )
 
@@ -111,16 +143,16 @@ def analyze_with_browser(item: str):
 
             page.wait_for_timeout(35000)
 
-            body_text = page.locator("body").inner_text(timeout=60000)
+            final_text = page.locator("body").inner_text(timeout=60000)
 
-            supply, valuation_usd = extract_metrics_from_text(body_text)
+            supply, valuation_usd = extract_metrics_from_text(final_text)
 
             if supply is None or valuation_usd is None:
                 raise HTTPException(
                     status_code=502,
                     detail={
                         "erro": "Não consegui ler Est. Supply ou Market Valuation.",
-                        "preview_texto": body_text[:2500],
+                        "preview_texto": final_text[:2500],
                     },
                 )
 
@@ -153,7 +185,12 @@ def home():
     return {
         "ok": True,
         "service": "Fenix Sheets API",
-        "routes": ["/health", "/debug", "/analyze?item=Sticker%20%7C%20FalleN%20(Holo)%20%7C%20Cologne%202026"],
+        "version": "1.3.0",
+        "routes": [
+            "/health",
+            "/debug",
+            "/analyze?item=Sticker%20%7C%20FalleN%20(Holo)%20%7C%20Cologne%202026",
+        ],
     }
 
 
@@ -167,22 +204,33 @@ def debug():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
 
-        page = browser.new_page(viewport={"width": 1600, "height": 1000})
+        page = browser.new_page(
+            viewport={"width": 1600, "height": 1000},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        )
 
         try:
-            page.goto(FENIX_APP_URL, wait_until="domcontentloaded", timeout=120000)
-            page.wait_for_timeout(30000)
-
-            body_text = page.locator("body").inner_text(timeout=30000)
+            response, html, body_text = open_fenix_page(page)
 
             return {
                 "fenix_url": FENIX_APP_URL,
+                "final_url": page.url,
+                "status": response.status if response else None,
+                "title": page.title(),
+                "html_length": len(html),
+                "body_length": len(body_text),
                 "inputs": page.locator("input").count(),
                 "textareas": page.locator("textarea").count(),
                 "buttons": page.locator("button").count(),
+                "html_preview": html[:3000],
                 "body_preview": body_text[:3000],
             }
 
