@@ -12,7 +12,7 @@ APP_TOKEN = os.getenv("FENIX_TOKEN", "troque-este-token")
 FENIX_APP_URL = os.getenv("FENIX_APP_URL", "https://cs2item-calculator-by-fenixs.streamlit.app/")
 STEAMDT_BASE = "https://www.steamdt.com/en"
 
-app = FastAPI(title="Fenix Sheets API", version="1.3.0")
+app = FastAPI(title="Fenix Sheets API", version="1.4.0")
 
 
 def build_steamdt_search_url(item: str) -> str:
@@ -35,7 +35,6 @@ def get_usd_brl() -> float:
 
 def money_to_float(text: str) -> Optional[float]:
     cleaned = re.sub(r"[^0-9.,]", "", text or "")
-
     if not cleaned:
         return None
 
@@ -65,19 +64,64 @@ def extract_metrics_from_text(text: str):
     return supply, valuation_usd
 
 
-def open_fenix_page(page):
-    response = page.goto(
-        FENIX_APP_URL,
-        wait_until="load",
-        timeout=120000,
+def create_browser_page(p):
+    browser = p.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-setuid-sandbox",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1600,1000",
+        ],
     )
 
-    page.wait_for_timeout(45000)
+    context = browser.new_context(
+        viewport={"width": 1600, "height": 1000},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        java_script_enabled=True,
+        ignore_https_errors=True,
+    )
+
+    page = context.new_page()
+    return browser, page
+
+
+def load_fenix(page):
+    console_logs = []
+    page_errors = []
+
+    page.on("console", lambda msg: console_logs.append(f"{msg.type}: {msg.text}"))
+    page.on("pageerror", lambda exc: page_errors.append(str(exc)))
+
+    response = page.goto(FENIX_APP_URL, wait_until="domcontentloaded", timeout=120000)
+
+    for _ in range(6):
+        page.wait_for_timeout(10000)
+        inputs = page.locator("input").count()
+        textareas = page.locator("textarea").count()
+        buttons = page.locator("button").count()
+        body_text = page.locator("body").inner_text(timeout=10000)
+
+        if inputs > 0 or textareas > 0 or buttons > 0 or len(body_text.strip()) > 20:
+            break
 
     html = page.content()
     body_text = page.locator("body").inner_text(timeout=30000)
 
-    return response, html, body_text
+    return {
+        "response": response,
+        "html": html,
+        "body_text": body_text,
+        "console_logs": console_logs[-30:],
+        "page_errors": page_errors[-20:],
+    }
 
 
 def analyze_with_browser(item: str):
@@ -85,66 +129,51 @@ def analyze_with_browser(item: str):
     fenix_input_url = build_fenix_input_url(item)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-
-        page = browser.new_page(
-            viewport={"width": 1600, "height": 1000},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        )
+        browser, page = create_browser_page(p)
 
         try:
-            response, html, body_text = open_fenix_page(page)
+            loaded = load_fenix(page)
 
-            total_inputs = page.locator("input").count()
-            total_textareas = page.locator("textarea").count()
-            total_buttons = page.locator("button").count()
+            inputs = page.locator("input").count()
+            textareas = page.locator("textarea").count()
+            buttons = page.locator("button").count()
 
-            if total_inputs > 0:
+            if inputs > 0:
                 field = page.locator("input").first
-            elif total_textareas > 0:
+            elif textareas > 0:
                 field = page.locator("textarea").first
             else:
                 raise HTTPException(
                     status_code=502,
                     detail={
-                        "erro": "Nenhum input ou textarea encontrado no Fenix Engine.",
-                        "status": response.status if response else None,
-                        "final_url": page.url,
+                        "erro": "O Streamlit abriu, mas não renderizou o campo de busca.",
+                        "status": loaded["response"].status if loaded["response"] else None,
                         "title": page.title(),
-                        "html_length": len(html),
-                        "body_length": len(body_text),
-                        "inputs": total_inputs,
-                        "textareas": total_textareas,
-                        "buttons": total_buttons,
-                        "html_preview": html[:2000],
-                        "body_preview": body_text[:2000],
+                        "inputs": inputs,
+                        "textareas": textareas,
+                        "buttons": buttons,
+                        "body_length": len(loaded["body_text"]),
+                        "html_length": len(loaded["html"]),
+                        "body_preview": loaded["body_text"][:2000],
+                        "console_logs": loaded["console_logs"],
+                        "page_errors": loaded["page_errors"],
                     },
                 )
 
             field.wait_for(state="visible", timeout=120000)
             field.fill(fenix_input_url)
 
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)
 
             try:
                 button = page.get_by_role("button", name=re.compile("analyze|analisar", re.I)).first
                 button.click(timeout=60000)
             except Exception:
-                button = page.locator("button").last
-                button.click(timeout=60000)
+                page.locator("button").last.click(timeout=60000)
 
-            page.wait_for_timeout(35000)
+            page.wait_for_timeout(45000)
 
             final_text = page.locator("body").inner_text(timeout=60000)
-
             supply, valuation_usd = extract_metrics_from_text(final_text)
 
             if supply is None or valuation_usd is None:
@@ -152,7 +181,7 @@ def analyze_with_browser(item: str):
                     status_code=502,
                     detail={
                         "erro": "Não consegui ler Est. Supply ou Market Valuation.",
-                        "preview_texto": final_text[:2500],
+                        "preview_texto": final_text[:3000],
                     },
                 )
 
@@ -171,10 +200,7 @@ def analyze_with_browser(item: str):
             }
 
         except PlaywrightTimeoutError as e:
-            raise HTTPException(
-                status_code=504,
-                detail=f"Timeout ao consultar o Fenix Engine: {e}",
-            )
+            raise HTTPException(status_code=504, detail=f"Timeout ao consultar o Fenix Engine: {e}")
 
         finally:
             browser.close()
@@ -185,12 +211,7 @@ def home():
     return {
         "ok": True,
         "service": "Fenix Sheets API",
-        "version": "1.3.0",
-        "routes": [
-            "/health",
-            "/debug",
-            "/analyze?item=Sticker%20%7C%20FalleN%20(Holo)%20%7C%20Cologne%202026",
-        ],
+        "version": "1.4.0",
     }
 
 
@@ -202,36 +223,24 @@ def health():
 @app.get("/debug")
 def debug():
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-
-        page = browser.new_page(
-            viewport={"width": 1600, "height": 1000},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-        )
+        browser, page = create_browser_page(p)
 
         try:
-            response, html, body_text = open_fenix_page(page)
+            loaded = load_fenix(page)
 
             return {
                 "fenix_url": FENIX_APP_URL,
                 "final_url": page.url,
-                "status": response.status if response else None,
+                "status": loaded["response"].status if loaded["response"] else None,
                 "title": page.title(),
-                "html_length": len(html),
-                "body_length": len(body_text),
+                "html_length": len(loaded["html"]),
+                "body_length": len(loaded["body_text"]),
                 "inputs": page.locator("input").count(),
                 "textareas": page.locator("textarea").count(),
                 "buttons": page.locator("button").count(),
-                "html_preview": html[:3000],
-                "body_preview": body_text[:3000],
+                "body_preview": loaded["body_text"][:3000],
+                "console_logs": loaded["console_logs"],
+                "page_errors": loaded["page_errors"],
             }
 
         finally:
