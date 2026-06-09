@@ -12,12 +12,11 @@ APP_TOKEN = os.getenv("FENIX_TOKEN", "troque-este-token")
 FENIX_APP_URL = os.getenv("FENIX_APP_URL", "https://cs2item-calculator-by-fenixs.streamlit.app/")
 STEAMDT_BASE = "https://www.steamdt.com/en"
 
-app = FastAPI(title="Fenix Sheets API", version="1.4.0")
+app = FastAPI(title="Fenix Sheets API", version="1.5.0")
 
 
 def build_steamdt_search_url(item: str) -> str:
-    encoded = urllib.parse.quote_plus(item)
-    return f"{STEAMDT_BASE}/mkt?search={encoded}"
+    return f"{STEAMDT_BASE}/mkt?search={urllib.parse.quote_plus(item)}"
 
 
 def build_fenix_input_url(item: str) -> str:
@@ -37,12 +36,10 @@ def money_to_float(text: str) -> Optional[float]:
     cleaned = re.sub(r"[^0-9.,]", "", text or "")
     if not cleaned:
         return None
-
     if "," in cleaned and "." in cleaned:
         cleaned = cleaned.replace(",", "")
     elif "," in cleaned and "." not in cleaned:
         cleaned = cleaned.replace(",", ".")
-
     try:
         return float(cleaned)
     except ValueError:
@@ -72,7 +69,6 @@ def create_browser_page(p):
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--disable-setuid-sandbox",
-            "--disable-features=IsolateOrigins,site-per-process",
             "--disable-blink-features=AutomationControlled",
             "--window-size=1600,1000",
         ],
@@ -89,8 +85,7 @@ def create_browser_page(p):
         ignore_https_errors=True,
     )
 
-    page = context.new_page()
-    return browser, page
+    return browser, context.new_page()
 
 
 def load_fenix(page):
@@ -102,26 +97,78 @@ def load_fenix(page):
 
     response = page.goto(FENIX_APP_URL, wait_until="domcontentloaded", timeout=120000)
 
-    for _ in range(6):
+    for _ in range(9):
         page.wait_for_timeout(10000)
-        inputs = page.locator("input").count()
-        textareas = page.locator("textarea").count()
-        buttons = page.locator("button").count()
-        body_text = page.locator("body").inner_text(timeout=10000)
 
-        if inputs > 0 or textareas > 0 or buttons > 0 or len(body_text.strip()) > 20:
+        all_inputs = 0
+        all_textareas = 0
+        all_buttons = 0
+        all_text = ""
+
+        for frame in page.frames:
+            try:
+                all_inputs += frame.locator("input").count()
+                all_textareas += frame.locator("textarea").count()
+                all_buttons += frame.locator("button").count()
+                all_text += "\n" + frame.locator("body").inner_text(timeout=3000)
+            except Exception:
+                pass
+
+        if all_inputs > 0 or all_textareas > 0 or all_buttons > 0 or len(all_text.strip()) > 20:
             break
 
-    html = page.content()
-    body_text = page.locator("body").inner_text(timeout=30000)
+    return response, console_logs, page_errors
 
-    return {
-        "response": response,
-        "html": html,
-        "body_text": body_text,
-        "console_logs": console_logs[-30:],
-        "page_errors": page_errors[-20:],
-    }
+
+def find_working_frame(page):
+    for frame in page.frames:
+        try:
+            inputs = frame.locator("input").count()
+            textareas = frame.locator("textarea").count()
+            buttons = frame.locator("button").count()
+            text = frame.locator("body").inner_text(timeout=3000)
+
+            if inputs > 0 or textareas > 0 or buttons > 0 or len(text.strip()) > 20:
+                return frame
+        except Exception:
+            continue
+
+    return page.main_frame
+
+
+def get_all_frame_debug(page):
+    frames_debug = []
+
+    for idx, frame in enumerate(page.frames):
+        try:
+            body_text = frame.locator("body").inner_text(timeout=5000)
+        except Exception:
+            body_text = ""
+
+        try:
+            html = frame.content()
+        except Exception:
+            html = ""
+
+        try:
+            inputs = frame.locator("input").count()
+            textareas = frame.locator("textarea").count()
+            buttons = frame.locator("button").count()
+        except Exception:
+            inputs = textareas = buttons = 0
+
+        frames_debug.append({
+            "index": idx,
+            "url": frame.url,
+            "inputs": inputs,
+            "textareas": textareas,
+            "buttons": buttons,
+            "body_length": len(body_text),
+            "html_length": len(html),
+            "body_preview": body_text[:1500],
+        })
+
+    return frames_debug
 
 
 def analyze_with_browser(item: str):
@@ -132,48 +179,47 @@ def analyze_with_browser(item: str):
         browser, page = create_browser_page(p)
 
         try:
-            loaded = load_fenix(page)
+            response, console_logs, page_errors = load_fenix(page)
+            frame = find_working_frame(page)
 
-            inputs = page.locator("input").count()
-            textareas = page.locator("textarea").count()
-            buttons = page.locator("button").count()
+            inputs = frame.locator("input").count()
+            textareas = frame.locator("textarea").count()
 
             if inputs > 0:
-                field = page.locator("input").first
+                field = frame.locator("input").first
             elif textareas > 0:
-                field = page.locator("textarea").first
+                field = frame.locator("textarea").first
             else:
                 raise HTTPException(
                     status_code=502,
                     detail={
-                        "erro": "O Streamlit abriu, mas não renderizou o campo de busca.",
-                        "status": loaded["response"].status if loaded["response"] else None,
+                        "erro": "Nenhum campo encontrado nem dentro dos iframes.",
+                        "status": response.status if response else None,
                         "title": page.title(),
-                        "inputs": inputs,
-                        "textareas": textareas,
-                        "buttons": buttons,
-                        "body_length": len(loaded["body_text"]),
-                        "html_length": len(loaded["html"]),
-                        "body_preview": loaded["body_text"][:2000],
-                        "console_logs": loaded["console_logs"],
-                        "page_errors": loaded["page_errors"],
+                        "frames": get_all_frame_debug(page),
+                        "console_logs": console_logs[-30:],
+                        "page_errors": page_errors[-20:],
                     },
                 )
 
-            field.wait_for(state="visible", timeout=120000)
             field.fill(fenix_input_url)
-
             page.wait_for_timeout(1500)
 
             try:
-                button = page.get_by_role("button", name=re.compile("analyze|analisar", re.I)).first
+                button = frame.get_by_role("button", name=re.compile("analyze|analisar", re.I)).first
                 button.click(timeout=60000)
             except Exception:
-                page.locator("button").last.click(timeout=60000)
+                frame.locator("button").last.click(timeout=60000)
 
             page.wait_for_timeout(45000)
 
-            final_text = page.locator("body").inner_text(timeout=60000)
+            final_text = ""
+            for fr in page.frames:
+                try:
+                    final_text += "\n" + fr.locator("body").inner_text(timeout=5000)
+                except Exception:
+                    pass
+
             supply, valuation_usd = extract_metrics_from_text(final_text)
 
             if supply is None or valuation_usd is None:
@@ -182,6 +228,7 @@ def analyze_with_browser(item: str):
                     detail={
                         "erro": "Não consegui ler Est. Supply ou Market Valuation.",
                         "preview_texto": final_text[:3000],
+                        "frames": get_all_frame_debug(page),
                     },
                 )
 
@@ -196,7 +243,7 @@ def analyze_with_browser(item: str):
                 "steamdt_url": steamdt_search_url,
                 "fenix_url": FENIX_APP_URL,
                 "fenix_input_url": fenix_input_url,
-                "source": "fenix_engine_browser",
+                "source": "fenix_engine_browser_iframe",
             }
 
         except PlaywrightTimeoutError as e:
@@ -208,11 +255,7 @@ def analyze_with_browser(item: str):
 
 @app.get("/")
 def home():
-    return {
-        "ok": True,
-        "service": "Fenix Sheets API",
-        "version": "1.4.0",
-    }
+    return {"ok": True, "service": "Fenix Sheets API", "version": "1.5.0"}
 
 
 @app.get("/health")
@@ -226,21 +269,17 @@ def debug():
         browser, page = create_browser_page(p)
 
         try:
-            loaded = load_fenix(page)
+            response, console_logs, page_errors = load_fenix(page)
 
             return {
                 "fenix_url": FENIX_APP_URL,
                 "final_url": page.url,
-                "status": loaded["response"].status if loaded["response"] else None,
+                "status": response.status if response else None,
                 "title": page.title(),
-                "html_length": len(loaded["html"]),
-                "body_length": len(loaded["body_text"]),
-                "inputs": page.locator("input").count(),
-                "textareas": page.locator("textarea").count(),
-                "buttons": page.locator("button").count(),
-                "body_preview": loaded["body_text"][:3000],
-                "console_logs": loaded["console_logs"],
-                "page_errors": loaded["page_errors"],
+                "total_frames": len(page.frames),
+                "frames": get_all_frame_debug(page),
+                "console_logs": console_logs[-30:],
+                "page_errors": page_errors[-20:],
             }
 
         finally:
@@ -255,5 +294,4 @@ def analyze(
     if x_fenix_token != APP_TOKEN:
         raise HTTPException(status_code=401, detail="Token inválido")
 
-    result = analyze_with_browser(item)
-    return JSONResponse(result)
+    return JSONResponse(analyze_with_browser(item))
